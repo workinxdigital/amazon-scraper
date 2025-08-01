@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-import json, logging, random, re, time
-from urllib.parse import urlparse, urljoin
-
+import json, logging, random, re, sys, time
+from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -35,35 +34,34 @@ def get_text(el):
 def extract_asin(url_or_asin):
     if re.match(r"^[A-Z0-9]{10}$", url_or_asin):
         return url_or_asin
-    for pattern in [
-        r"/dp/([A-Z0-9]{10})", r"/gp/product/([A-Z0-9]{10})",
-        r"/product-reviews/([A-Z0-9]{10})", r"/([A-Z0-9]{10})(?:[/?]|$)"
-    ]:
-        m = re.search(pattern, url_or_asin)
-        if m:
-            return m.group(1)
+    patterns = [r"/dp/([A-Z0-9]{10})", r"/gp/product/([A-Z0-9]{10})",
+                r"/product-reviews/([A-Z0-9]{10})", r"/([A-Z0-9]{10})(?:[/?]|$)"]
+    for pattern in patterns:
+        match = re.search(pattern, url_or_asin)
+        if match:
+            return match.group(1)
     return None
 
 def normalize_url(asin_or_url):
     asin = extract_asin(asin_or_url)
     if not asin:
-        raise ValueError("Could not extract ASIN from input.")
+        raise ValueError("Invalid ASIN or URL")
     return f"https://www.amazon.com/dp/{asin}", asin
 
 # ─── FETCHERS ──────────────────────────────────────────────────────────────────
 def fetch_static(url):
     try:
         headers = {
+            "User-Agent": random.choice(USER_AGENTS),
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": url,
-            "User-Agent": random.choice(USER_AGENTS)
         }
         proxies = {"http": get_proxy_url(), "https": get_proxy_url()}
         resp = requests.get(url, headers=headers, proxies=proxies, timeout=15)
         resp.raise_for_status()
         return resp.text
     except Exception as e:
-        logging.warning("Static fetch failed for %s: %s", url, e)
+        logging.warning("Static fetch failed: %s", e)
         return None
 
 def fetch_full_page(url):
@@ -90,9 +88,8 @@ def fetch_full_page(url):
         driver.quit()
         return html
     except Exception as e:
-        logging.warning("Full-page fetch failed for %s: %s", url, e)
-        if driver:
-            driver.quit()
+        logging.warning("Full-page fetch failed: %s", e)
+        if driver: driver.quit()
         return None
 
 # ─── PARSERS ───────────────────────────────────────────────────────────────────
@@ -110,11 +107,17 @@ def parse_price(soup):
 
 def parse_rating(soup):
     txt = get_text(soup.select_one("i.a-icon-star span.a-icon-alt"))
-    return {"rating": float(txt.split()[0]) if txt else None}
+    try:
+        return {"rating": float(txt.split()[0])} if txt else {"rating": None}
+    except:
+        return {"rating": None}
 
 def parse_review_count(soup):
     rc = get_text(soup.select_one("#acrCustomerReviewText"))
-    return {"review_count": int(rc.split()[0].replace(",", "")) if rc else 0}
+    try:
+        return {"review_count": int(rc.split()[0].replace(",", ""))} if rc else {"review_count": 0}
+    except:
+        return {"review_count": 0}
 
 def parse_images(soup):
     thumb = soup.select_one("#landingImage")
@@ -140,14 +143,13 @@ def parse_top_review(soup):
         }
     }
 
-# ─── FINAL WRAPPER ─────────────────────────────────────────────────────────────
+# ─── WRAPPER ───────────────────────────────────────────────────────────────────
 def scrape_product(url):
     html = fetch_static(url) or fetch_full_page(url)
     if not html:
-        raise Exception("Failed to load page")
+        raise Exception("Failed to load page content.")
     soup = BeautifulSoup(html, "html.parser")
-
-    result = {
+    return {
         "url": url,
         **parse_listing(soup),
         **parse_brand(soup),
@@ -158,33 +160,41 @@ def scrape_product(url):
         **parse_features(soup),
         **parse_top_review(soup)
     }
-    return result
 
 def to_openai_payload(scraped, asin):
     return {
         "asin": asin,
         "url": scraped.get("url"),
-        "title": scraped.get("title"),
-        "brand": scraped.get("brand"),
+        "title": scraped.get("title") or "N/A",
+        "brand": scraped.get("brand") or "Unknown",
         "price": scraped.get("price", {}).get("value"),
         "currency": scraped.get("price", {}).get("currency"),
-        "features": scraped.get("features"),
-        "description": (scraped.get("review") or {}).get("content"),  # Fallback
-        "images": scraped.get("images", []),
-        "thumbnail": scraped.get("thumbnail"),
+        "features": scraped.get("features") or [],
+        "description": (scraped.get("review") or {}).get("content") or "",
+        "images": scraped.get("images") or [],
+        "thumbnail": scraped.get("thumbnail") or "",
         "rating": scraped.get("rating"),
         "review_count": scraped.get("review_count"),
-        "review_summary": scraped.get("review", {})
+        "review_summary": scraped.get("review") or {}
     }
 
-# ─── SERVICE CLASS ─────────────────────────────────────────────────────────────
 class AmazonScraperService:
     def scrape_amazon_product(self, asin_or_url):
         url, asin = normalize_url(asin_or_url)
         raw = scrape_product(url)
         return to_openai_payload(raw, asin)
 
-# Example usage
-# scraper = AmazonScraperService()
-# data = scraper.scrape_amazon_product("B09XXXXXXX")
-# print(json.dumps(data, indent=2))
+# ─── ENTRY POINT ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "Missing ASIN or URL"}))
+        sys.exit(1)
+
+    scraper = AmazonScraperService()
+    try:
+        result = scraper.scrape_amazon_product(sys.argv[1])
+        print(json.dumps(result, indent=2))
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
+
