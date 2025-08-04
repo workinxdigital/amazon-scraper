@@ -1,10 +1,15 @@
-#!/usr/bin/env python3
-import json, logging, random, re, sys, time
-from urllib.parse import urlparse
+import os
+import json
+import logging
+import random
+import re
+import time
 import requests
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from flask import Flask, request, jsonify, send_from_directory
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 PROXY_HOST = "gate.decodo.com"
@@ -23,6 +28,20 @@ PRICE_SELECTORS = [
     "#priceblock_saleprice", "#priceblock_businessprice", "#priceblock_pospromoprice",
 ]
 
+# ─── IMAGE DOWNLOADER ──────────────────────────────────────────────────────────
+def download_image(url, save_dir='static/images'):
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    filename = url.split('/')[-1].split('?')[0]
+    filepath = os.path.join(save_dir, filename)
+    if not os.path.exists(filepath):
+        resp = requests.get(url, stream=True)
+        if resp.status_code == 200:
+            with open(filepath, 'wb') as f:
+                for chunk in resp.iter_content(1024):
+                    f.write(chunk)
+    return f"/static/images/{filename}"
+
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
 def get_proxy_url():
     port = random.choice(PROXY_PORTS)
@@ -34,34 +53,35 @@ def get_text(el):
 def extract_asin(url_or_asin):
     if re.match(r"^[A-Z0-9]{10}$", url_or_asin):
         return url_or_asin
-    patterns = [r"/dp/([A-Z0-9]{10})", r"/gp/product/([A-Z0-9]{10})",
-                r"/product-reviews/([A-Z0-9]{10})", r"/([A-Z0-9]{10})(?:[/?]|$)"]
-    for pattern in patterns:
-        match = re.search(pattern, url_or_asin)
-        if match:
-            return match.group(1)
+    for pattern in [
+        r"/dp/([A-Z0-9]{10})", r"/gp/product/([A-Z0-9]{10})",
+        r"/product-reviews/([A-Z0-9]{10})", r"/([A-Z0-9]{10})(?:[/?]|$)"
+    ]:
+        m = re.search(pattern, url_or_asin)
+        if m:
+            return m.group(1)
     return None
 
 def normalize_url(asin_or_url):
     asin = extract_asin(asin_or_url)
     if not asin:
-        raise ValueError("Invalid ASIN or URL")
+        raise ValueError("Could not extract ASIN from input.")
     return f"https://www.amazon.com/dp/{asin}", asin
 
 # ─── FETCHERS ──────────────────────────────────────────────────────────────────
 def fetch_static(url):
     try:
         headers = {
-            "User-Agent": random.choice(USER_AGENTS),
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": url,
+            "User-Agent": random.choice(USER_AGENTS)
         }
         proxies = {"http": get_proxy_url(), "https": get_proxy_url()}
         resp = requests.get(url, headers=headers, proxies=proxies, timeout=15)
         resp.raise_for_status()
         return resp.text
     except Exception as e:
-        logging.warning("Static fetch failed: %s", e)
+        logging.warning("Static fetch failed for %s: %s", url, e)
         return None
 
 def fetch_full_page(url):
@@ -88,8 +108,9 @@ def fetch_full_page(url):
         driver.quit()
         return html
     except Exception as e:
-        logging.warning("Full-page fetch failed: %s", e)
-        if driver: driver.quit()
+        logging.warning("Full-page fetch failed for %s: %s", url, e)
+        if driver:
+            driver.quit()
         return None
 
 # ─── PARSERS ───────────────────────────────────────────────────────────────────
@@ -107,24 +128,21 @@ def parse_price(soup):
 
 def parse_rating(soup):
     txt = get_text(soup.select_one("i.a-icon-star span.a-icon-alt"))
-    try:
-        return {"rating": float(txt.split()[0])} if txt else {"rating": None}
-    except:
-        return {"rating": None}
+    return {"rating": float(txt.split()[0]) if txt else None}
 
 def parse_review_count(soup):
     rc = get_text(soup.select_one("#acrCustomerReviewText"))
-    try:
-        return {"review_count": int(rc.split()[0].replace(",", ""))} if rc else {"review_count": 0}
-    except:
-        return {"review_count": 0}
+    return {"review_count": int(rc.split()[0].replace(",", "")) if rc else 0}
 
 def parse_images(soup):
     thumb = soup.select_one("#landingImage")
     gallery = [img.get("src") or img.get("data-src") for img in soup.select("#altImages img") if img.get("src") or img.get("data-src")]
+    # Download images and return local paths
+    local_gallery = [download_image(url) for url in gallery]
+    local_thumb = download_image(thumb["src"]) if thumb else (local_gallery[0] if local_gallery else None)
     return {
-        "thumbnail": thumb["src"] if thumb else None,
-        "images": gallery
+        "thumbnail": local_thumb,
+        "images": local_gallery
     }
 
 def parse_features(soup):
@@ -143,13 +161,14 @@ def parse_top_review(soup):
         }
     }
 
-# ─── WRAPPER ───────────────────────────────────────────────────────────────────
+# ─── SCRAPER FUNCTIONS ─────────────────────────────────────────────────────────
 def scrape_product(url):
     html = fetch_static(url) or fetch_full_page(url)
     if not html:
-        raise Exception("Failed to load page content.")
+        raise Exception("Failed to load page")
     soup = BeautifulSoup(html, "html.parser")
-    return {
+
+    result = {
         "url": url,
         **parse_listing(soup),
         **parse_brand(soup),
@@ -160,41 +179,57 @@ def scrape_product(url):
         **parse_features(soup),
         **parse_top_review(soup)
     }
+    return result
 
 def to_openai_payload(scraped, asin):
     return {
         "asin": asin,
         "url": scraped.get("url"),
-        "title": scraped.get("title") or "N/A",
-        "brand": scraped.get("brand") or "Unknown",
+        "title": scraped.get("title"),
+        "brand": scraped.get("brand"),
         "price": scraped.get("price", {}).get("value"),
         "currency": scraped.get("price", {}).get("currency"),
-        "features": scraped.get("features") or [],
-        "description": (scraped.get("review") or {}).get("content") or "",
-        "images": scraped.get("images") or [],
-        "thumbnail": scraped.get("thumbnail") or "",
+        "features": scraped.get("features"),
+        "description": (scraped.get("review") or {}).get("content"),
+        "images": scraped.get("images", []),
+        "thumbnail": scraped.get("thumbnail"),
         "rating": scraped.get("rating"),
         "review_count": scraped.get("review_count"),
-        "review_summary": scraped.get("review") or {}
+        "review_summary": scraped.get("review", {})
     }
 
-class AmazonScraperService:
-    def scrape_amazon_product(self, asin_or_url):
-        url, asin = normalize_url(asin_or_url)
-        raw = scrape_product(url)
-        return to_openai_payload(raw, asin)
+# ─── FLASK APP ─────────────────────────────────────────────────────────────────
+app = Flask(__name__)
 
-# ─── ENTRY POINT ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(json.dumps({"error": "Missing ASIN or URL"}))
-        sys.exit(1)
+logging.basicConfig(level=logging.INFO)
 
-    scraper = AmazonScraperService()
+@app.route('/scrape', methods=['POST'])
+def scrape_amazon_product():
     try:
-        result = scraper.scrape_amazon_product(sys.argv[1])
-        print(json.dumps(result, indent=2))
+        data = request.get_json()
+        asin_or_url = data.get('asin_or_url')
+        if not asin_or_url:
+            return jsonify({'error': 'asin_or_url is required'}), 400
+        url, asin = normalize_url(asin_or_url)
+        app.logger.info(f"Scraping product: {asin} - {url}")
+        raw_data = scrape_product(url)
+        result = to_openai_payload(raw_data, asin)
+        app.logger.info(f"Successfully scraped product: {asin}")
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+    except ValueError as e:
+        app.logger.error(f"Invalid input: {e}")
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
-        sys.exit(1)
+        app.logger.error(f"Scraping failed: {e}")
+        return jsonify({"error": f"Scraping failed: {str(e)}"}), 500
 
+@app.route('/static/images/<filename>')
+def get_image(filename):
+    return send_from_directory('static/images', filename)
+
+if __name__ == '__main__':
+    print("Starting Amazon Scraper API with local image serving...")
+    app.run(debug=True, host='0.0.0.0', port=5000)
